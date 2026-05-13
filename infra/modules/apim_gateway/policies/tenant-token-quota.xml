@@ -1,0 +1,57 @@
+<!--
+  Per-tenant Azure OpenAI token quota.
+
+  Uses the azure-openai-token-limit policy (GA in APIM, 2024) which
+  understands the token accounting structure of Azure OpenAI responses.
+  Counts both prompt and completion tokens against the per-tenant TPM ceiling.
+
+  Limits are tier-based via APIM named values:
+    token-limit-standard:  10,000 tokens/min
+    token-limit-premium:   100,000 tokens/min
+
+  Estimator: counts tokens before sending the request to backend so that
+  oversized prompts are rejected without consuming backend capacity.
+
+  Headers returned:
+    X-RateLimit-Tokens-Limit       : configured TPM
+    X-RateLimit-Tokens-Remaining   : remaining in current window
+    X-RateLimit-Tokens-Reset       : seconds until window resets
+-->
+<azure-openai-token-limit
+    tokens-per-minute="@{
+      var tier = (string)context.Variables.GetValueOrDefault("tenant_tier", "standard");
+      var quotaKey = "token-limit-" + tier;
+      var quota = context.Variables.GetValueOrDefault<string>(quotaKey) ?? "10000";
+      return int.Parse(quota);
+    }"
+    counter-key="@((string)context.Variables["tenant_id"])"
+    estimate-prompt-tokens="true"
+    tokens-consumed-header-name="X-Tokens-Consumed"
+    remaining-tokens-header-name="X-RateLimit-Tokens-Remaining"
+    retry-after-header-name="Retry-After" />
+
+<!--
+  Custom 429 response with tenant context, in addition to the default APIM behavior.
+-->
+<choose>
+  <when condition="@(context.Response.StatusCode == 429 && context.Response.Headers.GetValueOrDefault("X-RateLimit-Tokens-Remaining", "1") == "0")">
+    <return-response>
+      <set-status code="429" reason="Token Quota Exceeded" />
+      <set-header name="Content-Type" exists-action="override">
+        <value>application/json</value>
+      </set-header>
+      <set-body>@{
+        var tenantId = context.Variables.GetValueOrDefault<string>("tenant_id") ?? "unknown";
+        var tier = context.Variables.GetValueOrDefault<string>("tenant_tier") ?? "standard";
+        var retryAfter = context.Response.Headers.GetValueOrDefault("Retry-After", "60");
+        return new JObject(
+          new JProperty("error", "token_quota_exceeded"),
+          new JProperty("tenant_id", tenantId),
+          new JProperty("tier", tier),
+          new JProperty("retry_after_seconds", int.Parse(retryAfter)),
+          new JProperty("message", $"Token quota exceeded for tenant '{tenantId}' on tier '{tier}'. Tokens-per-minute window resets in {retryAfter}s.")
+        ).ToString();
+      }</set-body>
+    </return-response>
+  </when>
+</choose>

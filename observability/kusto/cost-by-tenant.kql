@@ -1,0 +1,150 @@
+// =============================================================================
+// FinDocs Cost-by-Tenant — Kusto queries for Log Analytics
+//
+// Source: AppEvents table receives structured events emitted by the
+// cost-attribution.xml policy on every successful AI request.
+//
+// Event schema (from cost-attribution.xml):
+//   event_type          : "ai_request_cost" | "ai_request_error"
+//   tenant_id           : tenant slug ("tech", "banks", "energy")
+//   tenant_tier         : "standard" | "premium"
+//   correlation_id      : request GUID
+//   model_deployment    : "gpt-4o-primary", "ada-002-primary", etc.
+//   region              : "eastus" | "eastus2"
+//   prompt_tokens       : int
+//   completion_tokens   : int
+//   total_tokens        : int
+//   estimated_cost_usd  : decimal (rounded to 6 places)
+//   status_code         : int (HTTP)
+//   duration_ms         : int
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// Query 1: Daily cost rollup by tenant (last 30 days)
+// Used by the per-tenant dashboard widget.
+// -----------------------------------------------------------------------------
+AppEvents
+| where TimeGenerated >= ago(30d)
+| where Name == "ai_request_cost"
+| extend
+    tenant_id          = tostring(Properties.tenant_id),
+    estimated_cost_usd = todecimal(Properties.estimated_cost_usd),
+    total_tokens       = toint(Properties.total_tokens)
+| summarize
+    daily_cost_usd   = sum(estimated_cost_usd),
+    daily_tokens     = sum(total_tokens),
+    daily_requests   = count()
+  by
+    tenant_id,
+    bin(TimeGenerated, 1d)
+| order by TimeGenerated desc, tenant_id asc
+
+
+// -----------------------------------------------------------------------------
+// Query 2: Month-to-date cost per tenant per model
+// Powers the monthly chargeback report.
+// -----------------------------------------------------------------------------
+AppEvents
+| where TimeGenerated >= startofmonth(now())
+| where Name == "ai_request_cost"
+| extend
+    tenant_id          = tostring(Properties.tenant_id),
+    model_deployment   = tostring(Properties.model_deployment),
+    estimated_cost_usd = todecimal(Properties.estimated_cost_usd),
+    prompt_tokens      = toint(Properties.prompt_tokens),
+    completion_tokens  = toint(Properties.completion_tokens)
+| summarize
+    mtd_cost_usd          = sum(estimated_cost_usd),
+    mtd_prompt_tokens     = sum(prompt_tokens),
+    mtd_completion_tokens = sum(completion_tokens),
+    mtd_requests          = count()
+  by
+    tenant_id,
+    model_deployment
+| extend
+    avg_cost_per_request_usd = round(mtd_cost_usd / mtd_requests, 4)
+| order by tenant_id asc, mtd_cost_usd desc
+
+
+// -----------------------------------------------------------------------------
+// Query 3: Hourly cost trend for the past 24h (real-time tenant dashboard)
+// -----------------------------------------------------------------------------
+AppEvents
+| where TimeGenerated >= ago(24h)
+| where Name == "ai_request_cost"
+| extend
+    tenant_id          = tostring(Properties.tenant_id),
+    estimated_cost_usd = todecimal(Properties.estimated_cost_usd)
+| summarize
+    hourly_cost_usd  = sum(estimated_cost_usd),
+    hourly_requests  = count()
+  by
+    tenant_id,
+    bin(TimeGenerated, 1h)
+| render timechart
+
+
+// -----------------------------------------------------------------------------
+// Query 4: Cost anomaly detection
+// Flags tenants whose hourly cost in the last hour exceeds 2x their trailing
+// 30-day same-hour average. Used by the cost-anomaly alert rule.
+// -----------------------------------------------------------------------------
+let baseline =
+    AppEvents
+    | where TimeGenerated between (ago(30d) .. ago(1h))
+    | where Name == "ai_request_cost"
+    | extend
+        tenant_id          = tostring(Properties.tenant_id),
+        estimated_cost_usd = todecimal(Properties.estimated_cost_usd),
+        hour_of_day        = hourofday(TimeGenerated)
+    | summarize
+        avg_hourly_cost = avg(estimated_cost_usd)
+      by
+        tenant_id,
+        hour_of_day;
+let current =
+    AppEvents
+    | where TimeGenerated >= ago(1h)
+    | where Name == "ai_request_cost"
+    | extend
+        tenant_id          = tostring(Properties.tenant_id),
+        estimated_cost_usd = todecimal(Properties.estimated_cost_usd),
+        hour_of_day        = hourofday(TimeGenerated)
+    | summarize
+        current_hour_cost = sum(estimated_cost_usd)
+      by
+        tenant_id,
+        hour_of_day;
+current
+| join kind=inner baseline on tenant_id, hour_of_day
+| extend
+    anomaly_ratio = round(current_hour_cost / avg_hourly_cost, 2)
+| where anomaly_ratio >= 2.0
+| project
+    tenant_id,
+    hour_of_day,
+    current_hour_cost,
+    avg_hourly_cost,
+    anomaly_ratio
+| order by anomaly_ratio desc
+
+
+// -----------------------------------------------------------------------------
+// Query 5: Quota breach events by tenant (powers the rate-limit-breach alert)
+// -----------------------------------------------------------------------------
+AppRequests
+| where TimeGenerated >= ago(24h)
+| where ResultCode == "429"
+| extend
+    tenant_id = tostring(Properties.tenant_id),
+    breach_type =
+      iff(Properties.error == "rate_limit_exceeded", "rate_limit",
+      iff(Properties.error == "token_quota_exceeded", "token_quota", "other"))
+| summarize
+    breach_count = count()
+  by
+    tenant_id,
+    breach_type,
+    bin(TimeGenerated, 1h)
+| order by TimeGenerated desc, tenant_id asc

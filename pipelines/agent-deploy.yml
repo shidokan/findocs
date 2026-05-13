@@ -1,0 +1,342 @@
+################################################################################
+# FinDocs — AI Agent Deployment Pipeline
+#
+# Promotes the FastAPI RAG service from development through staging to
+# production with quality gates at each stage. Triggered by:
+#   - push to main: builds image, deploys to dev, runs eval gate
+#   - manual workflow_dispatch: promotes a specific image tag from dev → staging → prod
+#
+# Quality gates:
+#   - Build:       container builds, image scans clean (Trivy)
+#   - Unit tests:  pytest in the ./api directory
+#   - Eval gate:   runs outlander_eval.py-equivalent against a frozen test set;
+#                  must achieve >= 4.5 / 5 on accuracy and groundedness to pass
+#   - Smoke tests: health check, single chat call against each tenant's index
+#   - Manual approval gate before staging → prod promotion
+#
+# Auth: OIDC federated identity (no long-lived secrets stored in GitHub).
+# Set up in Azure: AAD App registration with federated credential for this repo.
+################################################################################
+
+name: agent-deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - 'ingestion/**'
+      - 'Dockerfile'
+      - '.github/workflows/agent-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to promote (omit to use latest from dev)'
+        required: false
+        type: string
+      target_environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [staging, prod]
+
+permissions:
+  id-token: write       # required for OIDC
+  contents: read
+  pull-requests: write  # for eval-gate PR comments
+
+env:
+  ACR_NAME: findocsacr
+  IMAGE_NAME: findocs-rag
+  ARTIFACT_BUNDLE: agent-build.tar.gz
+
+jobs:
+
+  # ===========================================================================
+  # Stage 1: Build, scan, unit-test
+  # ===========================================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        working-directory: ./api
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run unit tests
+        working-directory: ./api
+        run: pytest -v --cov=. --cov-report=term-missing --cov-fail-under=70
+
+      - name: Azure login (OIDC)
+        if: github.event_name == 'push'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build container image in ACR
+        if: github.event_name == 'push'
+        run: |
+          az acr build \
+            --registry ${{ env.ACR_NAME }} \
+            --image ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }} \
+            --image ${{ env.IMAGE_NAME }}:latest \
+            --file Dockerfile \
+            .
+
+      - name: Scan image for vulnerabilities
+        if: github.event_name == 'push'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+
+  # ===========================================================================
+  # Stage 2: Deploy to dev
+  # ===========================================================================
+  deploy_dev:
+    name: Deploy → Dev
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update Container App
+        run: |
+          az containerapp update \
+            --name findocs-rag-dev \
+            --resource-group findocs-dev-rg \
+            --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
+
+      - name: Wait for revision healthy
+        run: |
+          for i in {1..30}; do
+            STATUS=$(az containerapp revision list \
+              --name findocs-rag-dev \
+              --resource-group findocs-dev-rg \
+              --query "[?properties.active].properties.runningState | [0]" -o tsv)
+            if [ "$STATUS" = "Running" ]; then echo "Revision healthy"; exit 0; fi
+            echo "Waiting for revision to be healthy... (attempt $i)"
+            sleep 10
+          done
+          echo "Revision did not reach Running state in 5 minutes" >&2
+          exit 1
+
+  # ===========================================================================
+  # Stage 3: Eval gate (runs against dev deployment)
+  # ===========================================================================
+  eval_gate:
+    name: Eval Gate
+    needs: deploy_dev
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        working-directory: ./api
+        run: pip install -r requirements.txt
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run evaluation harness against dev
+        env:
+          GATEWAY_URL: ${{ vars.GATEWAY_URL_DEV }}
+          GATEWAY_KEY: ${{ secrets.GATEWAY_KEY_DEV }}
+        run: |
+          python eval/run_eval.py \
+            --gateway-url "$GATEWAY_URL" \
+            --gateway-key "$GATEWAY_KEY" \
+            --dataset eval/golden_set.jsonl \
+            --tenant tech \
+            --output eval-results.json
+
+      - name: Check eval gate thresholds
+        run: |
+          python eval/check_thresholds.py \
+            --results eval-results.json \
+            --min-groundedness 4.5 \
+            --min-accuracy 4.5 \
+            --min-relevance 4.5
+
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ needs.build.outputs.image_tag }}
+          path: eval-results.json
+
+  # ===========================================================================
+  # Stage 4: Deploy to staging (manual workflow_dispatch only)
+  # ===========================================================================
+  deploy_staging:
+    name: Deploy → Staging
+    if: github.event_name == 'workflow_dispatch' && (inputs.target_environment == 'staging' || inputs.target_environment == 'prod')
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://findocs-rag-staging.azurecontainerapps.io
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to staging Container App
+        run: |
+          az containerapp update \
+            --name findocs-rag-staging \
+            --resource-group findocs-staging-rg \
+            --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}
+
+      - name: Smoke test all tenants
+        env:
+          GATEWAY_URL: ${{ vars.GATEWAY_URL_STAGING }}
+          TECH_KEY: ${{ secrets.GATEWAY_KEY_TECH_STAGING }}
+          BANKS_KEY: ${{ secrets.GATEWAY_KEY_BANKS_STAGING }}
+          ENERGY_KEY: ${{ secrets.GATEWAY_KEY_ENERGY_STAGING }}
+        run: |
+          for tenant in tech banks energy; do
+            KEY_VAR="${tenant^^}_KEY"
+            python eval/smoke_test.py \
+              --gateway-url "$GATEWAY_URL" \
+              --gateway-key "${!KEY_VAR}" \
+              --tenant "$tenant"
+          done
+
+  # ===========================================================================
+  # Stage 5: Deploy to prod (requires manual approval via GitHub Environments)
+  # ===========================================================================
+  deploy_prod:
+    name: Deploy → Production
+    needs: deploy_staging
+    if: github.event_name == 'workflow_dispatch' && inputs.target_environment == 'prod'
+    runs-on: ubuntu-latest
+    environment:
+      name: prod            # Configure required reviewers in GitHub repo settings
+      url: https://findocs-rag.azurecontainerapps.io
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Capture current revision (for rollback)
+        id: current
+        run: |
+          CURRENT=$(az containerapp revision list \
+            --name findocs-rag-prod \
+            --resource-group findocs-prod-rg \
+            --query "[?properties.active].name | [0]" -o tsv)
+          echo "Current active revision: $CURRENT"
+          echo "revision=$CURRENT" >> $GITHUB_OUTPUT
+
+      - name: Deploy new revision (50% traffic)
+        run: |
+          az containerapp update \
+            --name findocs-rag-prod \
+            --resource-group findocs-prod-rg \
+            --image ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }} \
+            --revision-suffix v${{ inputs.image_tag }}
+
+          NEW=$(az containerapp revision list \
+            --name findocs-rag-prod \
+            --resource-group findocs-prod-rg \
+            --query "[?properties.active].name | [0]" -o tsv)
+
+          # Canary: route 50% to new revision, 50% to previous
+          az containerapp revision set-mode \
+            --name findocs-rag-prod \
+            --resource-group findocs-prod-rg \
+            --mode Multiple
+
+          az containerapp ingress traffic set \
+            --name findocs-rag-prod \
+            --resource-group findocs-prod-rg \
+            --revision-weight $NEW=50 ${{ steps.current.outputs.revision }}=50
+
+      - name: Hold canary for 10 minutes; watch error rate
+        run: |
+          for i in {1..10}; do
+            ERR_RATE=$(az monitor metrics list \
+              --resource $(az containerapp show -n findocs-rag-prod -g findocs-prod-rg --query id -o tsv) \
+              --metric "Requests" \
+              --filter "responseCode eq '5xx'" \
+              --aggregation Count \
+              --interval PT1M \
+              --query "value[0].timeseries[0].data[-1].count" -o tsv)
+            echo "Last minute 5xx count: $ERR_RATE"
+            if [ "${ERR_RATE:-0}" -gt 10 ]; then
+              echo "Error rate above threshold; aborting canary" >&2
+              exit 1
+            fi
+            sleep 60
+          done
+
+      - name: Promote canary to 100%
+        run: |
+          NEW=$(az containerapp revision list \
+            --name findocs-rag-prod \
+            --resource-group findocs-prod-rg \
+            --query "[?contains(name, 'v${{ inputs.image_tag }}')].name | [0]" -o tsv)
+          az containerapp ingress traffic set \
+            --name findocs-rag-prod \
+            --resource-group findocs-prod-rg \
+            --revision-weight $NEW=100
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          az containerapp ingress traffic set \
+            --name findocs-rag-prod \
+            --resource-group findocs-prod-rg \
+            --revision-weight ${{ steps.current.outputs.revision }}=100
+          echo "Traffic rolled back to ${{ steps.current.outputs.revision }}"

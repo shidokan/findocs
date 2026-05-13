@@ -1,0 +1,57 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+**/secrets.tfvars
+**/terraform.tfvars
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+
+# Downloaded filings (large; regenerate from edgar_fetcher.py)
+filings/
+**/_manifest.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Mac OS
+.DS_Store
+._*
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project-specific
+*.zip
+*.log
+*.tmp
+eval-results*.json

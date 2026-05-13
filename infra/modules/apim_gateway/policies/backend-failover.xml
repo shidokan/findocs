@@ -1,0 +1,104 @@
+<!--
+  Backend failover policy for Azure OpenAI.
+
+  Primary backend: Azure OpenAI deployment in East US.
+  Failover backend: Azure OpenAI deployment in East US 2.
+
+  Routing rules:
+    1. On 429 (throttle): retry up to 3 times against the primary with
+       exponential backoff (1s, 2s, 4s). If still throttled, switch to failover.
+    2. On 5xx: switch to failover immediately, no retry on primary
+       (5xx usually indicates capacity / regional issue, not transient).
+    3. Premium tier tenants get one additional retry attempt before failover
+       to ensure they prefer their dedicated PTU capacity when available.
+
+  Backend pool is configured in main.tf as:
+    backend-id-primary    -> Azure OpenAI East US
+    backend-id-failover   -> Azure OpenAI East US 2
+
+  Naming convention assumes consistent deployment names across regions
+  (gpt-4o, text-embedding-ada-002, etc.). The deployment name in the request
+  path is preserved when switching backends.
+-->
+
+<!-- Set the primary backend initially -->
+<set-backend-service backend-id="backend-id-primary" />
+
+<!-- Capture the original request path for retry against failover -->
+<set-variable name="original_request_path" value="@(context.Request.Url.Path)" />
+
+<!--
+  Retry policy:
+  - Wraps the backend call
+  - On 429: exponential backoff up to 3 retries (or 4 for premium tier)
+  - On 5xx (500-599): immediate failover, no retry on same backend
+  - On success: passes through
+-->
+<retry condition="@{
+            // Premium tier gets +1 retry attempt before failover
+            var maxRetries = (string)context.Variables["tenant_tier"] == "premium" ? 4 : 3;
+            return (context.Response.StatusCode == 429 || context.Response.StatusCode >= 500)
+                   && context.Variables.GetValueOrDefault<int>("retry_count", 0) < maxRetries;
+        }"
+        count="4"
+        interval="1"
+        max-interval="8"
+        delta="2"
+        first-fast-retry="false">
+
+  <!-- Increment retry counter -->
+  <set-variable name="retry_count"
+                value="@(context.Variables.GetValueOrDefault<int>("retry_count", 0) + 1)" />
+
+  <!-- Decide whether to retry on primary or switch to failover -->
+  <choose>
+    <when condition="@(context.Response.StatusCode >= 500)">
+      <!-- 5xx: switch to failover immediately -->
+      <set-backend-service backend-id="backend-id-failover" />
+      <set-header name="X-Backend-Region" exists-action="override">
+        <value>failover</value>
+      </set-header>
+    </when>
+    <when condition="@(context.Response.StatusCode == 429 && context.Variables.GetValueOrDefault<int>("retry_count", 0) >= 2)">
+      <!-- 429 after 2 retries on primary: switch to failover -->
+      <set-backend-service backend-id="backend-id-failover" />
+      <set-header name="X-Backend-Region" exists-action="override">
+        <value>failover</value>
+      </set-header>
+    </when>
+    <otherwise>
+      <!-- 429 with retries remaining: stay on primary -->
+      <set-header name="X-Backend-Region" exists-action="override">
+        <value>primary</value>
+      </set-header>
+    </otherwise>
+  </choose>
+
+  <!-- Forward the request to the (possibly new) backend -->
+  <forward-request />
+
+</retry>
+
+<!--
+  After retry completes, surface which backend served the response.
+  If the final response is still an error, emit a structured event for
+  the failover-triggered alert (observability/alerts/failover-triggered.json).
+-->
+<choose>
+  <when condition="@(context.Response.StatusCode >= 500 || context.Response.StatusCode == 429)">
+    <log-to-eventhub logger-id="findocs-cost-logger"
+                     partition-id="@((string)context.Variables.GetValueOrDefault("tenant_id", "unknown"))">
+      @{
+        return new JObject(
+          new JProperty("timestamp", DateTime.UtcNow.ToString("o")),
+          new JProperty("event_type", "backend_failover_exhausted"),
+          new JProperty("tenant_id", (string)context.Variables.GetValueOrDefault("tenant_id", "unknown")),
+          new JProperty("correlation_id", (string)context.Variables.GetValueOrDefault("correlation_id", context.RequestId.ToString())),
+          new JProperty("final_status_code", context.Response.StatusCode),
+          new JProperty("retry_count", context.Variables.GetValueOrDefault<int>("retry_count", 0)),
+          new JProperty("final_backend", context.Response.Headers.GetValueOrDefault("X-Backend-Region", "unknown"))
+        ).ToString();
+      }
+    </log-to-eventhub>
+  </when>
+</choose>

@@ -1,0 +1,132 @@
+<!--
+  Content safety policy enforcement at the gateway.
+
+  Calls Azure AI Content Safety on the inbound user message before
+  forwarding to Azure OpenAI. If any severity dimension exceeds the
+  configured threshold, returns 400 with a structured violation response.
+
+  This is the gateway-side enforcement that runs UNIFORMLY across all
+  tenants regardless of how their agents are implemented. Tenant agent
+  developers don't need to remember to call Content Safety themselves.
+
+  Severity scale (Azure AI Content Safety):
+    0 = Safe
+    2 = Low
+    4 = Medium
+    6 = High
+
+  Categories evaluated:
+    Hate, Sexual, SelfHarm, Violence
+
+  Default threshold = 4 (medium); configurable per-tenant via named values:
+    content-safety-threshold-{tenant_id}  (overrides default)
+    content-safety-threshold-default       (default = 4)
+-->
+
+<!-- 1. Extract the user message from the OpenAI Chat Completions request body -->
+<set-variable name="user_message"
+              value="@{
+                var body = context.Request.Body.As<JObject>(preserveContent: true);
+                var messages = body?["messages"] as JArray;
+                if (messages == null) return "";
+                // Get the last user message (most recent input)
+                var lastUser = messages.Reverse()
+                                       .FirstOrDefault(m => (string)m["role"] == "user");
+                return (string)lastUser?["content"] ?? "";
+              }" />
+
+<!-- 2. Skip the check if there's no user message (e.g., embedding requests) -->
+<choose>
+  <when condition="@(!string.IsNullOrWhiteSpace((string)context.Variables["user_message"]))">
+
+    <!-- 3. Call Azure Content Safety analyze-text endpoint -->
+    <send-request mode="new"
+                  response-variable-name="safety_response"
+                  timeout="10"
+                  ignore-error="true">
+      <set-url>@($"{(string)context.Variables.GetValueOrDefault<string>("content-safety-endpoint")}/contentsafety/text:analyze?api-version=2023-10-01")</set-url>
+      <set-method>POST</set-method>
+      <set-header name="Ocp-Apim-Subscription-Key" exists-action="override">
+        <value>@((string)context.Variables.GetValueOrDefault<string>("content-safety-key"))</value>
+      </set-header>
+      <set-header name="Content-Type" exists-action="override">
+        <value>application/json</value>
+      </set-header>
+      <set-body>@{
+        return new JObject(
+          new JProperty("text", (string)context.Variables["user_message"]),
+          new JProperty("categories", new JArray("Hate", "Sexual", "SelfHarm", "Violence")),
+          new JProperty("outputType", "FourSeverityLevels")
+        ).ToString();
+      }</set-body>
+    </send-request>
+
+    <!-- 4. Determine per-tenant threshold (or default) -->
+    <set-variable name="safety_threshold"
+                  value="@{
+                    var tenantId = (string)context.Variables.GetValueOrDefault("tenant_id", "unknown");
+                    var perTenantKey = "content-safety-threshold-" + tenantId;
+                    var perTenant = context.Variables.GetValueOrDefault<string>(perTenantKey);
+                    var defaultThreshold = context.Variables.GetValueOrDefault<string>("content-safety-threshold-default") ?? "4";
+                    return int.Parse(perTenant ?? defaultThreshold);
+                  }" />
+
+    <!-- 5. Parse safety response and check each category against threshold -->
+    <set-variable name="max_severity"
+                  value="@{
+                    var response = (IResponse)context.Variables.GetValueOrDefault("safety_response");
+                    if (response == null || response.StatusCode != 200) {
+                      // If Content Safety call failed, fail open (allow) and log; don't break tenant traffic on Content Safety outage
+                      return 0;
+                    }
+                    var body = response.Body.As<JObject>(preserveContent: true);
+                    var analysis = body?["categoriesAnalysis"] as JArray;
+                    if (analysis == null) return 0;
+                    int maxSev = 0;
+                    foreach (var cat in analysis) {
+                      var sev = (int?)cat["severity"] ?? 0;
+                      if (sev > maxSev) maxSev = sev;
+                    }
+                    return maxSev;
+                  }" />
+
+    <!-- 6. Block if severity exceeds threshold -->
+    <choose>
+      <when condition="@((int)context.Variables["max_severity"] >= (int)context.Variables["safety_threshold"])">
+
+        <!-- Emit a content safety violation log for the per-tenant safety dashboard -->
+        <log-to-eventhub logger-id="findocs-cost-logger"
+                         partition-id="@((string)context.Variables["tenant_id"])">
+          @{
+            return new JObject(
+              new JProperty("timestamp", DateTime.UtcNow.ToString("o")),
+              new JProperty("event_type", "content_safety_violation"),
+              new JProperty("tenant_id", (string)context.Variables["tenant_id"]),
+              new JProperty("correlation_id", (string)context.Variables["correlation_id"]),
+              new JProperty("max_severity", (int)context.Variables["max_severity"]),
+              new JProperty("threshold", (int)context.Variables["safety_threshold"])
+            ).ToString();
+          }
+        </log-to-eventhub>
+
+        <return-response>
+          <set-status code="400" reason="Content Safety Violation" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>@{
+            return new JObject(
+              new JProperty("error", "content_safety_violation"),
+              new JProperty("tenant_id", (string)context.Variables["tenant_id"]),
+              new JProperty("severity", (int)context.Variables["max_severity"]),
+              new JProperty("threshold", (int)context.Variables["safety_threshold"]),
+              new JProperty("correlation_id", (string)context.Variables["correlation_id"]),
+              new JProperty("message", "The request was blocked by content safety policy. See correlation_id for support reference.")
+            ).ToString();
+          }</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+  </when>
+</choose>

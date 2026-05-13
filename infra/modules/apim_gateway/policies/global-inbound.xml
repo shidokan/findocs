@@ -1,0 +1,102 @@
+<!--
+  Global inbound policy applied to every request hitting the OpenAI API.
+
+  Pipeline:
+    1. Extract subscription key
+    2. Look up tenant ID from named-value store keyed by subscription
+    3. Set internal context variables (tenant_id, tenant_tier)
+    4. Forward tenant ID to backend as X-Tenant-ID header
+    5. Set correlation ID for distributed tracing
+
+  Backend errors propagate untouched; logging happens in cost-attribution.xml
+  on the outbound side.
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- 1. CORS for the FastAPI service consumers; tighten in production -->
+    <cors allow-credentials="false">
+      <allowed-origins>
+        <origin>*</origin>
+      </allowed-origins>
+      <allowed-methods>
+        <method>GET</method>
+        <method>POST</method>
+        <method>OPTIONS</method>
+      </allowed-methods>
+      <allowed-headers>
+        <header>*</header>
+      </allowed-headers>
+    </cors>
+
+    <!-- 2. Reject requests missing subscription key (defense-in-depth; APIM also enforces this) -->
+    <choose>
+      <when condition="@(string.IsNullOrEmpty(context.Subscription?.Key))">
+        <return-response>
+          <set-status code="401" reason="Unauthorized" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":"missing_subscription_key","message":"Ocp-Apim-Subscription-Key header is required"}</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 3. Resolve tenant ID from APIM named value table.
+         Convention: named value "tenant-id-{subscription-id}" maps to the tenant slug.
+         e.g. tenant-id-abc123def456 = "tech" -->
+    <set-variable name="tenant_id"
+                  value="@{
+                    var lookupKey = "tenant-id-" + context.Subscription.Id;
+                    return context.Variables.GetValueOrDefault<string>(lookupKey)
+                           ?? context.Subscription.Name?.ToLowerInvariant()
+                           ?? "unknown";
+                  }" />
+
+    <!-- 4. Resolve tenant tier (standard / premium) — affects routing decisions later -->
+    <set-variable name="tenant_tier"
+                  value="@{
+                    var tierKey = "tenant-tier-" + (string)context.Variables["tenant_id"];
+                    return context.Variables.GetValueOrDefault<string>(tierKey) ?? "standard";
+                  }" />
+
+    <!-- 5. Correlation ID for distributed tracing -->
+    <set-variable name="correlation_id"
+                  value="@(context.RequestId.ToString())" />
+
+    <!-- 6. Set headers forwarded to backend OpenAI / FastAPI service -->
+    <set-header name="X-Tenant-ID" exists-action="override">
+      <value>@((string)context.Variables["tenant_id"])</value>
+    </set-header>
+    <set-header name="X-Tenant-Tier" exists-action="override">
+      <value>@((string)context.Variables["tenant_tier"])</value>
+    </set-header>
+    <set-header name="X-Correlation-ID" exists-action="override">
+      <value>@((string)context.Variables["correlation_id"])</value>
+    </set-header>
+
+    <!-- 7. Strip the subscription key from upstream request — backend doesn't need it -->
+    <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+
+    <!-- 8. Apply downstream policies (rate limit, token quota, content safety, failover) -->
+    <!-- Each is included by the API-level policy that references this global policy -->
+
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+    <!-- Surface tenant ID in error responses for support correlation -->
+    <set-header name="X-Tenant-ID" exists-action="override">
+      <value>@((string)context.Variables.GetValueOrDefault("tenant_id", "unknown"))</value>
+    </set-header>
+    <set-header name="X-Correlation-ID" exists-action="override">
+      <value>@((string)context.Variables.GetValueOrDefault("correlation_id", context.RequestId.ToString()))</value>
+    </set-header>
+  </on-error>
+</policies>

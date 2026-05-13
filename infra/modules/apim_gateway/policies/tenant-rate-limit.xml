@@ -1,0 +1,56 @@
+<!--
+  Per-tenant request rate limit.
+
+  Uses rate-limit-by-key with the tenant ID resolved by global-inbound.xml.
+  Limits are configured per-tier via APIM named values:
+    rate-limit-standard:  60 requests / 60 seconds
+    rate-limit-premium:  600 requests / 60 seconds
+
+  Counters are per-tenant, so one noisy tenant cannot starve another.
+
+  Headers returned on rate limit breach:
+    Retry-After: seconds until counter resets
+    X-RateLimit-Limit: configured limit
+    X-RateLimit-Remaining: 0 on breach
+-->
+<rate-limit-by-key
+    calls="@{
+      var tier = (string)context.Variables.GetValueOrDefault("tenant_tier", "standard");
+      var limitKey = "rate-limit-" + tier;
+      var limit = context.Variables.GetValueOrDefault<string>(limitKey) ?? "60";
+      return int.Parse(limit);
+    }"
+    renewal-period="60"
+    counter-key="@((string)context.Variables["tenant_id"])"
+    increment-condition="@(context.Response.StatusCode == 200)"
+    retry-after-header-name="Retry-After"
+    retry-after-variable-name="retry_after_seconds"
+    remaining-calls-header-name="X-RateLimit-Remaining"
+    total-calls-header-name="X-RateLimit-Limit" />
+
+<!--
+  Custom response on rate limit breach. APIM's default 429 message is opaque;
+  this surfaces the tenant and tier for client-side handling.
+-->
+<choose>
+  <when condition="@(context.Response.StatusCode == 429)">
+    <return-response>
+      <set-status code="429" reason="Too Many Requests" />
+      <set-header name="Content-Type" exists-action="override">
+        <value>application/json</value>
+      </set-header>
+      <set-body>@{
+        var retryAfter = context.Variables.GetValueOrDefault<string>("retry_after_seconds") ?? "60";
+        var tenantId = context.Variables.GetValueOrDefault<string>("tenant_id") ?? "unknown";
+        var tier = context.Variables.GetValueOrDefault<string>("tenant_tier") ?? "standard";
+        return new JObject(
+          new JProperty("error", "rate_limit_exceeded"),
+          new JProperty("tenant_id", tenantId),
+          new JProperty("tier", tier),
+          new JProperty("retry_after_seconds", int.Parse(retryAfter)),
+          new JProperty("message", $"Rate limit exceeded for tenant '{tenantId}' on tier '{tier}'. Retry after {retryAfter}s.")
+        ).ToString();
+      }</set-body>
+    </return-response>
+  </when>
+</choose>
